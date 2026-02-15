@@ -1,7 +1,5 @@
 import { s3Service } from './s3';
-import { emailService } from './email';
 import { db } from '@/lib/supabase';
-import { useAuth } from '@/contexts/AuthContext';
 
 export interface TranscriptionResult {
   text: string;
@@ -11,39 +9,26 @@ export interface TranscriptionResult {
 
 export async function transcribeAudio(file: File, language?: string, userId?: string): Promise<TranscriptionResult> {
   try {
-    // Upload file to S3 first
+    // Upload file to S3 (via presigned URL) and request server-side transcription
     let s3Key = '';
     if (userId) {
       const uploadResult = await s3Service.uploadFile(file, userId);
       s3Key = uploadResult.key;
     }
 
-    // Get signed URL for OpenAI API
-    const signedUrl = s3Key ? await s3Service.getSignedUrl(s3Key) : '';
-
-    // For now, we'll use the direct file approach since OpenAI API expects direct file upload
-    // In production, you might want to use a backend service to handle this securely
-
     const formData = new FormData();
-    formData.append('file', file);
-    formData.append('model', 'whisper-1');
-    if (language && language !== 'auto') {
-      formData.append('language', language);
-    }
-    formData.append('response_format', 'json');
+    if (s3Key) formData.append('s3Key', s3Key);
+    else formData.append('file', file);
+    if (language && language !== 'auto') formData.append('language', language);
+    if (userId) formData.append('userId', userId);
 
-    const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    // Call backend transcription endpoint (server should hold OPENAI_API_KEY)
+    const response = await fetch('/api/transcribe', {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${import.meta.env.VITE_OPENAI_API_KEY}`,
-      },
       body: formData,
     });
 
-    if (!response.ok) {
-      throw new Error(`Transcription failed: ${response.statusText}`);
-    }
-
+    if (!response.ok) throw new Error(`Transcription failed: ${response.statusText}`);
     const data = await response.json();
 
     // Update user minutes used if userId provided

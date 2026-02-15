@@ -1,14 +1,3 @@
-import AWS from 'aws-sdk';
-
-AWS.config.update({
-  accessKeyId: import.meta.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: import.meta.env.AWS_SECRET_ACCESS_KEY,
-  region: import.meta.env.AWS_REGION,
-});
-
-const s3 = new AWS.S3();
-const BUCKET_NAME = import.meta.env.AWS_S3_BUCKET;
-
 export interface UploadedFile {
   key: string;
   url: string;
@@ -17,52 +6,32 @@ export interface UploadedFile {
 
 export const s3Service = {
   async uploadFile(file: File, userId: string): Promise<UploadedFile> {
-    const fileExtension = file.name.split('.').pop();
-    const key = `uploads/${userId}/${Date.now()}-${Math.random().toString(36).substring(2)}.${fileExtension}`;
+    const filename = file.name;
+    const resp = await fetch(`/api/s3/sign?filename=${encodeURIComponent(filename)}&contentType=${encodeURIComponent(file.type)}&userId=${encodeURIComponent(userId || '')}`);
+    if (!resp.ok) throw new Error('Failed to get presigned URL');
+    const { url, key, bucket } = await resp.json();
 
-    const params = {
-      Bucket: BUCKET_NAME,
-      Key: key,
-      Body: file,
-      ContentType: file.type,
-      ACL: 'private', // Files are private, accessed via signed URLs
-    };
+    const put = await fetch(url, { method: 'PUT', body: file, headers: { 'Content-Type': file.type } });
+    if (!put.ok) throw new Error('Upload to S3 failed');
 
-    const result = await s3.upload(params).promise();
-
-    return {
-      key: result.Key,
-      url: result.Location,
-      bucket: result.Bucket,
-    };
+    return { key, url, bucket };
   },
 
   async getSignedUrl(key: string, expiresIn: number = 3600): Promise<string> {
-    const params = {
-      Bucket: BUCKET_NAME,
-      Key: key,
-      Expires: expiresIn, // URL expires in 1 hour by default
-    };
-
-    return s3.getSignedUrlPromise('getObject', params);
+    const resp = await fetch(`/api/s3/url?key=${encodeURIComponent(key)}&expiresIn=${expiresIn}`);
+    if (!resp.ok) throw new Error('Failed to get signed URL');
+    const { url } = await resp.json();
+    return url;
   },
 
   async deleteFile(key: string): Promise<void> {
-    const params = {
-      Bucket: BUCKET_NAME,
-      Key: key,
-    };
-
-    await s3.deleteObject(params).promise();
+    const resp = await fetch('/api/s3/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key }) });
+    if (!resp.ok) throw new Error('Failed to delete file');
   },
 
   async getFileMetadata(key: string) {
-    const params = {
-      Bucket: BUCKET_NAME,
-      Key: key,
-    };
-
-    const result = await s3.headObject(params).promise();
-    return result;
+    const resp = await fetch(`/api/s3/metadata?key=${encodeURIComponent(key)}`);
+    if (!resp.ok) throw new Error('Failed to get metadata');
+    return resp.json();
   }
 };

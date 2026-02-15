@@ -6,6 +6,8 @@ const { createClient } = require('@supabase/supabase-js');
 const nodemailer = require('nodemailer');
 const Razorpay = require('razorpay');
 const AWS = require('aws-sdk');
+const admin = require('firebase-admin');
+const FormData = require('form-data');
 const multer = require('multer');
 const multerS3 = require('multer-s3');
 require('dotenv').config();
@@ -41,6 +43,35 @@ const upload = multer({
     },
   }),
 });
+
+// Initialize Firebase Admin if service account provided
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  try {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    console.log('Firebase Admin initialized');
+  } catch (e) {
+    console.warn('Invalid FIREBASE_SERVICE_ACCOUNT, Firebase Admin not initialized');
+  }
+} else {
+  console.warn('FIREBASE_SERVICE_ACCOUNT not set; auth verification disabled');
+}
+
+// Simple middleware to verify Firebase ID token
+async function verifyFirebaseToken(req, res, next) {
+  if (!admin.apps.length) return next(); // skip if not initialized
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    console.error('Token verification failed', err);
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+}
 
 // Email transporter
 const transporter = nodemailer.createTransporter({
@@ -271,4 +302,106 @@ app.get('/api/health', (req, res) => {
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+});
+
+// Return a presigned PUT URL for client uploads
+app.get('/api/s3/sign', verifyFirebaseToken, async (req, res) => {
+  try {
+    const { filename, contentType, userId } = req.query;
+    if (!filename) return res.status(400).json({ error: 'filename required' });
+    const key = `uploads/${userId || 'anonymous'}/${Date.now()}_${String(filename)}`;
+    const params = {
+      Bucket: process.env.AWS_S3_BUCKET,
+      Key: key,
+      Expires: 60 * 10,
+      ContentType: contentType || 'application/octet-stream',
+      ACL: 'private',
+    };
+    const url = s3.getSignedUrl('putObject', params);
+    res.json({ url, key, bucket: process.env.AWS_S3_BUCKET });
+  } catch (err) {
+    console.error('Presign error', err);
+    res.status(500).json({ error: 'Failed to generate presigned url' });
+  }
+});
+
+app.get('/api/s3/url', verifyFirebaseToken, async (req, res) => {
+  try {
+    const { key, expiresIn } = req.query;
+    if (!key) return res.status(400).json({ error: 'key required' });
+    const url = s3.getSignedUrl('getObject', { Bucket: process.env.AWS_S3_BUCKET, Key: String(key), Expires: Number(expiresIn) || 3600 });
+    res.json({ url });
+  } catch (err) {
+    console.error('Get URL error', err);
+    res.status(500).json({ error: 'Failed to get url' });
+  }
+});
+
+app.post('/api/s3/delete', verifyFirebaseToken, express.json(), async (req, res) => {
+  try {
+    const { key } = req.body;
+    if (!key) return res.status(400).json({ error: 'key required' });
+    await s3.deleteObject({ Bucket: process.env.AWS_S3_BUCKET, Key: key }).promise();
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Delete error', err);
+    res.status(500).json({ error: 'Failed to delete' });
+  }
+});
+
+// Multer memory storage for direct uploads to server
+const memoryUpload = multer({ storage: multer.memoryStorage() });
+
+// Transcription endpoint — accepts s3Key or multipart file; server calls OpenAI
+app.post('/api/transcribe', verifyFirebaseToken, memoryUpload.single('file'), async (req, res) => {
+  try {
+    const { s3Key, language } = req.body;
+    let key = s3Key;
+    let originalFilename = '';
+
+    if (!key && req.file) {
+      // upload buffer to S3
+      originalFilename = req.file.originalname || `upload_${Date.now()}`;
+      const uploadKey = `uploads/${req.user?.uid || 'anonymous'}/${Date.now()}_${originalFilename}`;
+      await s3.putObject({ Bucket: process.env.AWS_S3_BUCKET, Key: uploadKey, Body: req.file.buffer, ContentType: req.file.mimetype, ACL: 'private' }).promise();
+      key = uploadKey;
+    }
+
+    if (!key) return res.status(400).json({ error: 'No file provided' });
+
+    // Call OpenAI Whisper transcription (server-side)
+    const form = new FormData();
+    // fetch the object from S3 as stream
+    const s3Stream = s3.getObject({ Bucket: process.env.AWS_S3_BUCKET, Key: key }).createReadStream();
+    form.append('file', s3Stream, originalFilename || 'audio');
+    form.append('model', 'whisper-1');
+    if (language) form.append('language', language);
+
+    const openaiResp = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+      body: form,
+    });
+
+    if (!openaiResp.ok) {
+      const text = await openaiResp.text();
+      console.error('OpenAI error', text);
+      return res.status(502).json({ error: 'Transcription failed' });
+    }
+
+    const data = await openaiResp.json();
+
+    // Persist transcription into Supabase (if available)
+    try {
+      const userId = req.user?.uid || req.body.userId;
+      await supabase.from('transcriptions').insert({ user_id: userId || null, filename: key, original_filename: originalFilename, s3_key: key, transcript: data.text, language: data.language || null, duration: data.duration || null, status: 'completed' });
+    } catch (dbErr) {
+      console.error('Supabase insert error', dbErr);
+    }
+
+    res.json({ text: data.text, language: data.language, duration: data.duration });
+  } catch (err) {
+    console.error('Transcription endpoint error', err);
+    res.status(500).json({ error: 'Transcription failed' });
+  }
 });
