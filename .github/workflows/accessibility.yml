@@ -1,0 +1,47 @@
+name: Accessibility Scan
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  accessibility:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build --if-present
+
+      - name: Serve built site
+        run: |
+          npx http-server ./dist -p 8080 &
+          sleep 2
+
+      - name: Run axe-core CLI (save JSON)
+        run: |
+          npx -y @axe-core/cli http://127.0.0.1:8080 --save axe-report.json || true
+
+      - name: Run pa11y (JSON)
+        run: |
+          npx -y pa11y http://127.0.0.1:8080 --reporter json > pa11y-report.json || true
+
+      - name: Upload accessibility reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: accessibility-reports
+          path: |
+            axe-report.json
+            pa11y-report.json
